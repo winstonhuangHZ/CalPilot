@@ -1,0 +1,15 @@
+# Build products
+.build/
+dist/
+bin/
+
+# Swift Package Manager
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Local CalPilot state never belongs in the tree, but guard against stray copies
+config.json
+journal.jsonl
+memory.json
