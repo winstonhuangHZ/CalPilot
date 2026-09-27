@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "calpilot", targets: ["calpilot"]),
+        .executable(name: "CalPilotApp", targets: ["CalPilotApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
@@ -18,6 +19,10 @@ let package = Package(
                 "CalPilotCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
+        ),
+        .executableTarget(
+            name: "CalPilotApp",
+            dependencies: ["CalPilotCore"]
         ),
     ]
 )

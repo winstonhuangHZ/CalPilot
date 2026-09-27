@@ -4,7 +4,8 @@ A macOS calendar assistant written in Swift. It reads every calendar you can see
 language model to work out how your week should be arranged, and writes the result into a
 calendar of its own — after you approve it, and in a way you can undo.
 
-Two ways to drive it: a one-shot `plan` command, and a turn-based `chat` agent.
+Three ways to drive it: a double-clickable window, a turn-based `chat` agent in the
+terminal, and a one-shot `plan` command.
 
 ## Requirements
 
@@ -15,13 +16,29 @@ Two ways to drive it: a one-shot `plan` command, and a turn-based `chat` agent.
 ## Build and install
 
 ```bash
-scripts/build-app.sh          # release binary + dist/CalPilot.app + bin/calpilot
+scripts/build-app.sh          # builds CalPilot.app (GUI) + bin/calpilot (CLI)
 bin/calpilot doctor           # triggers the calendar permission prompt
 bin/calpilot config set-key sk-...   # stored in the login keychain
 ```
 
+Then either double-click `dist/CalPilot.app` or run `bin/calpilot chat`.
+
 `doctor` will ask for calendar access the first time. Approve it in
 **System Settings → Privacy & Security → Calendars**.
+
+### The two faces of the bundle
+
+`CalPilot.app` contains both programs, so they share one permission identity:
+
+```
+Contents/MacOS/CalPilot        the SwiftUI window (double-click this)
+Contents/MacOS/calpilot-cli    the command line tool bin/calpilot execs
+```
+
+The window is a thin shell over the same engine: calendar sidebar, transcript with tool
+calls, a proposal card with **写入 / 放弃**, and settings for the model, work hours, and
+the memory block. Every guard rail applies here too — proposals are validated locally and
+nothing is written until you press the button.
 
 ### Why a bundle instead of a plain binary
 
@@ -222,6 +239,7 @@ Sources/CalPilotCore/     engine (no UI)
   PlanApplier.swift         the only writer; journals everything
   LLMClient.swift           OpenAI-compatible client, tools, cache-aware encoding
 Sources/calpilot/         CLI
+Sources/CalPilotApp/      SwiftUI window (AppModel + ContentView + SettingsView)
 scripts/build-app.sh      bundle assembly
 ```
 

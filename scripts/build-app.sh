@@ -25,10 +25,13 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> building release binary"
-swift build -c release --package-path "$ROOT" --scratch-path "$SCRATCH"
-BIN="$SCRATCH/release/calpilot"
-test -x "$BIN" || { echo "build produced no binary at $BIN" >&2; exit 1; }
+echo "==> building release binaries"
+swift build -c release --product CalPilotApp --package-path "$ROOT" --scratch-path "$SCRATCH"
+swift build -c release --product calpilot --package-path "$ROOT" --scratch-path "$SCRATCH"
+GUI_BIN="$SCRATCH/release/CalPilotApp"
+CLI_BIN="$SCRATCH/release/calpilot"
+test -x "$GUI_BIN" || { echo "build produced no GUI binary at $GUI_BIN" >&2; exit 1; }
+test -x "$CLI_BIN" || { echo "build produced no CLI binary at $CLI_BIN" >&2; exit 1; }
 
 echo "==> assembling $APP"
 if [[ -d "$APP" ]]; then
@@ -36,7 +39,10 @@ if [[ -d "$APP" ]]; then
   rm -rf "$APP"
 fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/CalPilot"
+# The GUI is the bundle's main executable; the CLI rides along inside the same bundle
+# so both share one permission identity.
+cp "$GUI_BIN" "$APP/Contents/MacOS/CalPilot"
+cp "$CLI_BIN" "$APP/Contents/MacOS/calpilot-cli"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -59,7 +65,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
-  <key>LSUIElement</key>
+  <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSCalendarsFullAccessUsageDescription</key>
   <string>CalPilot reads your existing events and writes the plans you approve into its own calendar.</string>
@@ -81,7 +87,7 @@ mkdir -p "$ROOT/bin"
 cat > "$ROOT/bin/calpilot" <<'LAUNCH'
 #!/bin/bash
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec "$ROOT/dist/CalPilot.app/Contents/MacOS/CalPilot" "$@"
+exec "$ROOT/dist/CalPilot.app/Contents/MacOS/calpilot-cli" "$@"
 LAUNCH
 chmod +x "$ROOT/bin/calpilot"
 
