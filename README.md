@@ -26,6 +26,21 @@ Then either double-click `dist/CalPilot.app` or run `bin/calpilot chat`.
 `doctor` will ask for calendar access the first time. Approve it in
 **System Settings → Privacy & Security → Calendars**.
 
+### App icon
+
+`assets/CalPilot.icns` is drawn by `scripts/generate-icon.swift` with CoreGraphics rather
+than generated as a bitmap, so the geometry is reproducible and each size is designed
+instead of downscaled:
+
+```bash
+swift scripts/generate-icon.swift   # rewrites assets/CalPilot.icns + assets/preview/
+```
+
+The design is a calendar page with binding rings; one time block is amber, the slot the
+model picked. Below 64pt the rings, the extra bars, and the spark turn to mush, so 32pt and
+16pt get progressively coarser drawings — three bands survive at 16pt, which is all that
+can be read at that size. Check `assets/preview/` after regenerating.
+
 ### The two faces of the bundle
 
 `CalPilot.app` contains both programs, so they share one permission identity:
@@ -240,6 +255,8 @@ Sources/CalPilotCore/     engine (no UI)
   LLMClient.swift           OpenAI-compatible client, tools, cache-aware encoding
 Sources/calpilot/         CLI
 Sources/CalPilotApp/      SwiftUI window (AppModel + ContentView + SettingsView)
+assets/CalPilot.icns      generated app icon + preview renders
+scripts/generate-icon.swift  icon generator (CoreGraphics)
 scripts/build-app.sh      bundle assembly
 ```
 
