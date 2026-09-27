@@ -9,6 +9,9 @@ bin/
 # macOS
 .DS_Store
 
+# Intermediate output of scripts/generate-icon.swift (the .icns already contains these)
+assets/CalPilot.iconset/
+
 # Local CalPilot state never belongs in the tree, but guard against stray copies
 config.json
 journal.jsonl
