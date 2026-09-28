@@ -21,8 +21,8 @@ struct ContentView: View {
                     InputBar(focused: $inputFocused)
                 }
                 Divider()
-                CalendarSidebar()
-                    .frame(width: 260)
+                SidebarView()
+                    .frame(width: 272)
             }
         }
         .sheet(isPresented: $model.showSettings) {
@@ -39,10 +39,34 @@ private struct StatusBar: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Image(systemName: "calendar.badge.clock")
                 .foregroundStyle(.tint)
-            Text("CalPilot").font(.headline)
+
+            Menu {
+                Button("新建对话") { model.newSession() }
+                Button("重命名当前对话…") { model.renameCurrentSession() }
+                Button("删除当前对话…") { model.deleteSession(id: model.currentSessionID) }
+                if !model.sessions.isEmpty {
+                    Divider()
+                }
+                ForEach(model.sessions) { session in
+                    Button {
+                        model.openSession(id: session.id)
+                    } label: {
+                        Text("\(session.id == model.currentSessionID ? "✓ " : "")\(session.title)  ·  \(session.messageCount) 条")
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(model.sessionTitle).lineLimit(1)
+                    Image(systemName: "chevron.down").font(.system(size: 8))
+                }
+                .font(.headline)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("切换、重命名或删除对话")
 
             Circle()
                 .fill(model.calendarReady ? Color.green : Color.orange)
@@ -65,12 +89,6 @@ private struct StatusBar: View {
                     .controlSize(.small)
                     .padding(.trailing, 4)
             }
-            Button {
-                model.resetConversation()
-            } label: {
-                Image(systemName: "arrow.counterclockwise")
-            }
-            .help("清空对话")
             Button {
                 model.undoLastBatch()
             } label: {
@@ -127,7 +145,7 @@ private struct TranscriptView: View {
 }
 
 private struct TurnRow: View {
-    let turn: Turn
+    let turn: ChatTurn
 
     var body: some View {
         switch turn.kind {
@@ -258,9 +276,9 @@ private struct InputBar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                quick("这周有哪些空闲时间", icon: "clock")
                 quick("帮我把这周安排一下", icon: "wand.and.stars")
-                quick("我这周有什么安排", icon: "calendar")
+                quick("我上个月时间都花哪了", icon: "chart.bar")
+                quick("这周有哪些空闲时间", icon: "clock")
                 Spacer()
             }
 
@@ -303,7 +321,45 @@ private struct InputBar: View {
 
 // MARK: - Sidebar
 
-private struct CalendarSidebar: View {
+private struct SidebarView: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Picker("", selection: Binding(
+                get: { model.sidebarMode },
+                set: { model.setSidebarMode($0) }
+            )) {
+                ForEach(SidebarMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(10)
+
+            Divider()
+
+            switch model.sidebarMode {
+            case .upcoming: UpcomingList()
+            case .past: HistoryPanel()
+            }
+
+            Divider()
+            VStack(alignment: .leading, spacing: 3) {
+                Text("记忆块 · \(model.memoryEntries.count) 条").font(.caption).bold()
+                Text("写入目标：\(model.config.writeCalendar)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+private struct UpcomingList: View {
     @EnvironmentObject private var model: AppModel
 
     private var calendar: Calendar { model.config.calendar }
@@ -323,8 +379,6 @@ private struct CalendarSidebar: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
-            Divider()
-
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
                     if model.upcoming.isEmpty {
@@ -332,41 +386,141 @@ private struct CalendarSidebar: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 12)
-                            .padding(.top, 8)
+                            .padding(.top, 6)
                     }
                     ForEach(model.upcoming) { event in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(event.title)
-                                .font(.system(size: 12))
-                                .lineLimit(2)
-                            HStack(spacing: 4) {
-                                Text(Format.day(event.start, calendar: calendar))
-                                Text("\(Format.clock(event.start, calendar: calendar))–\(Format.clock(event.end, calendar: calendar))")
-                            }
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            Text(event.calendarName)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 5)
+                        EventRow(event: event, calendar: calendar)
                     }
                 }
                 .padding(.vertical, 6)
             }
-
-            Divider()
-            VStack(alignment: .leading, spacing: 3) {
-                Text("记忆块 · \(model.memoryEntries.count) 条").font(.caption).bold()
-                Text("写入目标：\(model.config.writeCalendar)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+private struct HistoryPanel: View {
+    @EnvironmentObject private var model: AppModel
+
+    private var calendar: Calendar { model.config.calendar }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Picker("", selection: Binding(
+                    get: { model.historyDays },
+                    set: { model.setHistoryDays($0) }
+                )) {
+                    Text("7 天").tag(7)
+                    Text("30 天").tag(30)
+                    Text("90 天").tag(90)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Spacer()
+                Button {
+                    Task { await model.reloadHistory(force: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise").font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let analysis = model.analysis {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(analysis.summaryLines, id: \.self) { line in
+                                Text(line).font(.system(size: 11))
+                            }
+                        }
+
+                        if !analysis.byCalendar.isEmpty {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("按日历").font(.caption).bold()
+                                ForEach(analysis.byCalendar.prefix(6), id: \.calendarName) { share in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack {
+                                            Text(share.calendarName)
+                                                .font(.system(size: 11))
+                                                .lineLimit(1)
+                                            Spacer()
+                                            Text(Format.hours(share.hours))
+                                                .font(.system(size: 10, design: .monospaced))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        ProgressView(value: min(1, max(0, share.share)))
+                                            .controlSize(.small)
+                                    }
+                                }
+                            }
+                        }
+
+                        if !analysis.busiestDays.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("最忙的几天").font(.caption).bold()
+                                ForEach(analysis.busiestDays.prefix(4), id: \.date) { day in
+                                    HStack(spacing: 6) {
+                                        Text(Format.day(day.date, calendar: calendar))
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                        Text(Format.weekdayLabel(day.weekday))
+                                            .font(.system(size: 10))
+                                        Spacer()
+                                        Text(Format.hours(day.hours))
+                                            .font(.system(size: 10, design: .monospaced))
+                                    }
+                                }
+                            }
+                        }
+
+                        if !analysis.notes.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("观察").font(.caption).bold()
+                                ForEach(analysis.notes, id: \.self) { note in
+                                    Text("· " + note)
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    } else {
+                        Text(model.calendarReady ? "计算中…" : "未授权日历")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+}
+
+private struct EventRow: View {
+    let event: EventDTO
+    let calendar: Calendar
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(event.title)
+                .font(.system(size: 12))
+                .lineLimit(2)
+            HStack(spacing: 4) {
+                Text(Format.day(event.start, calendar: calendar))
+                Text("\(Format.clock(event.start, calendar: calendar))–\(Format.clock(event.end, calendar: calendar))")
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+            Text(event.calendarName)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
     }
 }

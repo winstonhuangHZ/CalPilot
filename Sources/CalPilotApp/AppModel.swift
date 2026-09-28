@@ -4,34 +4,33 @@ import EventKit
 import Foundation
 import SwiftUI
 
-/// One line in the visible transcript.
-struct Turn: Identifiable {
-    enum Kind {
-        case user
-        case assistant
-        case tool
-        case toolResult
-        case notice
-        case error
-    }
+/// Which window the right-hand sidebar is showing.
+enum SidebarMode: String, CaseIterable, Identifiable {
+    case upcoming
+    case past
 
-    let id = UUID()
-    var kind: Kind
-    var text: String
-    var at: Date = Date()
+    var id: String { rawValue }
+    var label: String { self == .upcoming ? "未来" : "过去" }
 }
 
 @MainActor
 final class AppModel: ObservableObject {
-    // Transcript
-    @Published var turns: [Turn] = []
+    // Conversation
+    @Published var turns: [ChatTurn] = []
     @Published var input: String = ""
     @Published var isBusy = false
+    @Published var sessionTitle: String = "新对话"
+    @Published var sessions: [SessionSummary] = []
 
     // Calendar state
     @Published var calendarStatus: String = "checking…"
     @Published var calendarReady = false
-    @Published var calendarCount = 0
+
+    // Sidebar
+    @Published var sidebarMode: SidebarMode = .upcoming
+    @Published var historyDays = 30
+    @Published var upcoming: [EventDTO] = []
+    @Published var analysis: CalendarAnalysis?
 
     // Model / plan state
     @Published var config: AppConfig
@@ -42,25 +41,37 @@ final class AppModel: ObservableObject {
 
     private var service = CalendarService()
     private var agent: Agent?
-    private var client: LLMClient?
-    private var lastLoadedAt: Date?
+    private var session = ChatSession()
+    private var lastCalendarLoad: Date?
+    private var lastHistoryLoad: Date?
 
     init() {
         self.config = (try? ConfigStore.loadOrCreate()) ?? AppConfig()
         self.memoryEntries = MemoryStore.loadRecovering().entries
+        // Pick up where the last conversation left off.
+        if let recent = SessionStore.mostRecent() {
+            self.session = recent
+            self.turns = recent.turns
+            self.sessionTitle = recent.title
+            self.pendingPlan = recent.agent.pendingPlan
+        }
+        self.sessions = SessionStore.list()
         bootstrap()
     }
+
+    var currentSessionID: UUID { session.id }
 
     // MARK: - Bootstrap
 
     private func bootstrap() {
-        turns = []
-        let key = Credentials.resolveAPIKey(config: config)
-        if key == nil {
+        for warning in config.schedulingWarnings {
+            append(.error, warning)
+        }
+        if Credentials.resolveAPIKey(config: config) == nil {
             append(.notice, "还没有配置 API Key。点右上角 Settings 填入，CalPilot 才能调用语言模型。")
-            append(.notice, "日历读取不需要 Key，可以先在上面看到你的日程。")
-        } else {
-            append(.assistant, "我是 CalPilot。告诉我这周想怎么安排，我会先看你的日历，再给出方案——写入前一定问你。")
+            append(.notice, "日历读取和分析不需要 Key，右边就能看。")
+        } else if turns.isEmpty {
+            append(.assistant, "我是 CalPilot。告诉我这周想怎么安排，或者问我过去一段时间的时间都花在哪了。")
         }
         connect()
     }
@@ -71,11 +82,10 @@ final class AppModel: ObservableObject {
                 let granted = try await service.requestFullAccess()
                 calendarReady = granted
                 if granted {
-                    let calendars = service.calendarDTOs()
-                    calendarCount = calendars.count
-                    calendarStatus = "\(calendars.count) 个日历可读"
+                    calendarStatus = "\(service.calendarDTOs().count) 个日历可读"
                     rebuildAgent()
                     await reloadCalendar(force: true)
+                    await reloadHistory(force: true)
                 } else {
                     calendarStatus = "未授权"
                     append(.error, "日历权限未授予。到「系统设置 → 隐私与安全性 → 日历」里允许 CalPilot。")
@@ -88,21 +98,22 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func rebuildAgent() {
+    private func rebuildAgent(restoring state: Agent.State? = nil) {
+        // Carry the live transcript across the rebuild; falling back to the stored session
+        // is what makes a restart resume rather than start over.
+        let carry = state ?? agent?.exportState() ?? session.agent
         guard let key = Credentials.resolveAPIKey(config: config) else {
             agent = nil
-            client = nil
             return
         }
-        let newClient = LLMClient(config: config, apiKey: key.key)
-        client = newClient
-        agent = Agent(
+        let client = LLMClient(config: config, apiKey: key.key)
+        let newAgent = Agent(
             config: config,
             service: service,
-            client: newClient,
+            client: client,
             memory: MemoryStore.loadRecovering(),
             confirm: { question in
-                // The agent asks on a background executor; a modal alert has to run on main.
+                // The agent asks from a background executor; a modal alert must run on main.
                 var answer = false
                 DispatchQueue.main.sync {
                     let alert = NSAlert()
@@ -118,6 +129,10 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async { self?.handle(event) }
             }
         )
+        newAgent.restore(carry)
+        agent = newAgent
+        pendingPlan = carry.pendingPlan
+        usageSummary = newAgent.cacheSummary
     }
 
     // MARK: - Turn handling
@@ -142,6 +157,7 @@ final class AppModel: ObservableObject {
             }
             isBusy = false
             usageSummary = agent.cacheSummary
+            persist()
         }
     }
 
@@ -164,7 +180,11 @@ final class AppModel: ObservableObject {
             pendingPlan = nil
             agent?.clearPendingPlan()
             append(.assistant, "已写入 \(created.count) 个事件到「\(created.first?.calendarName ?? config.writeCalendar)」。Command+Shift+Z 可以撤销。")
-            Task { await reloadCalendar(force: true) }
+            persist()
+            Task {
+                await reloadCalendar(force: true)
+                await reloadHistory(force: true)
+            }
         } catch {
             append(.error, "写入失败：\(error)")
         }
@@ -174,6 +194,7 @@ final class AppModel: ObservableObject {
         pendingPlan = nil
         agent?.clearPendingPlan()
         append(.notice, "已放弃当前提案。")
+        persist()
     }
 
     func undoLastBatch() {
@@ -190,35 +211,137 @@ final class AppModel: ObservableObject {
             } else {
                 append(.notice, "没有可撤销的批次。")
             }
-            Task { await reloadCalendar(force: true) }
+            persist()
+            Task {
+                await reloadCalendar(force: true)
+                await reloadHistory(force: true)
+            }
         } catch {
             append(.error, "撤销失败：\(error)")
         }
     }
 
-    func resetConversation() {
-        agent?.reset()
-        turns = []
-        pendingPlan = nil
-        append(.notice, "对话已清空（日历未改动）。")
-        bootstrap()
+    // MARK: - Sessions
+
+    /// Writes the visible turns plus the model transcript to disk.
+    private func persist() {
+        session.turns = turns
+        session.updatedAt = Date()
+        if let agent { session.agent = agent.exportState() }
+        if !session.titleIsManual {
+            session.title = ChatSession.suggestedTitle(from: turns)
+        }
+        sessionTitle = session.title
+        do {
+            try SessionStore.save(session)
+        } catch {
+            append(.error, "对话保存失败：\(error)")
+        }
+        sessions = SessionStore.list()
     }
 
-    // MARK: - Calendar snapshot
+    func newSession() {
+        persist()
+        session = ChatSession()
+        turns = []
+        pendingPlan = nil
+        sessionTitle = session.title
+        rebuildAgent(restoring: Agent.State())
+        append(.assistant, "新对话。想安排点什么？")
+        usageSummary = ""
+        persist()
+    }
 
-    @Published var upcoming: [EventDTO] = []
+    func openSession(id: UUID) {
+        guard id != session.id else { return }
+        persist()
+        guard let loaded = SessionStore.load(id: id) else { return }
+        session = loaded
+        turns = loaded.turns
+        sessionTitle = loaded.title
+        rebuildAgent(restoring: loaded.agent)
+        pendingPlan = loaded.agent.pendingPlan
+    }
+
+    func deleteSession(id: UUID) {
+        let title = sessions.first { $0.id == id }?.title ?? "这个对话"
+        let alert = NSAlert()
+        alert.messageText = "删除「\(title)」"
+        alert.informativeText = "只删除保存的对话记录，不影响日历。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try SessionStore.delete(id: id)
+        } catch {
+            append(.error, "删除失败：\(error)")
+        }
+        if id == session.id {
+            newSession()
+        } else {
+            sessions = SessionStore.list()
+        }
+    }
+
+    func renameCurrentSession() {
+        let alert = NSAlert()
+        alert.messageText = "重命名对话"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = sessionTitle
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        session.title = name
+        session.titleIsManual = true
+        sessionTitle = name
+        persist()
+    }
+
+    // MARK: - Calendar snapshots
 
     func reloadCalendar(force: Bool = false) async {
         guard calendarReady else { return }
-        if !force, let last = lastLoadedAt, Date().timeIntervalSince(last) < 5 { return }
-        lastLoadedAt = Date()
+        if !force, let last = lastCalendarLoad, Date().timeIntervalSince(last) < 5 { return }
+        lastCalendarLoad = Date()
         let calendar = config.calendar
         let start = Date()
         let end = calendar.date(byAdding: .day, value: 7, to: start) ?? start.addingTimeInterval(604_800)
         upcoming = service.events(from: start, to: end).filter { !$0.isAllDay }
     }
 
-    // MARK: - Settings
+    func reloadHistory(force: Bool = false) async {
+        guard calendarReady else { return }
+        if !force, let last = lastHistoryLoad, Date().timeIntervalSince(last) < 30 { return }
+        lastHistoryLoad = Date()
+        let calendar = config.calendar
+        let end = Date()
+        let start = calendar.date(byAdding: .day, value: -historyDays, to: end)
+            ?? end.addingTimeInterval(-Double(historyDays) * 86_400)
+        let events = service.events(from: start, to: end)
+        analysis = CalendarAnalyzer.analyze(events: events, config: config, rangeStart: start, rangeEnd: end)
+    }
+
+    func setHistoryDays(_ days: Int) {
+        historyDays = days
+        Task { await reloadHistory(force: true) }
+    }
+
+    func setSidebarMode(_ mode: SidebarMode) {
+        sidebarMode = mode
+        Task {
+            if mode == .past {
+                await reloadHistory(force: true)
+            } else {
+                await reloadCalendar(force: true)
+            }
+        }
+    }
+
+    // MARK: - Settings & memory
 
     func saveSettings(apiKey: String) {
         do {
@@ -229,7 +352,11 @@ final class AppModel: ObservableObject {
             }
             rebuildAgent()
             append(.notice, "设置已保存。")
-            Task { await reloadCalendar(force: true) }
+            persist()
+            Task {
+                await reloadCalendar(force: true)
+                await reloadHistory(force: true)
+            }
         } catch {
             append(.error, "保存失败：\(error)")
         }
@@ -242,6 +369,7 @@ final class AppModel: ObservableObject {
         memoryEntries = store.entries
         rebuildAgent()
         append(.notice, "记住了：\(text)")
+        persist()
     }
 
     func removeMemory(id: String) {
@@ -250,6 +378,7 @@ final class AppModel: ObservableObject {
         try? store.save()
         memoryEntries = store.entries
         rebuildAgent()
+        persist()
     }
 
     func togglePin(id: String) {
@@ -259,9 +388,10 @@ final class AppModel: ObservableObject {
         try? store.save()
         memoryEntries = store.entries
         rebuildAgent()
+        persist()
     }
 
-    // MARK: - Agent event rendering
+    // MARK: - Agent events
 
     private func handle(_ event: Agent.Event) {
         switch event {
@@ -273,9 +403,11 @@ final class AppModel: ObservableObject {
             append(.toolResult, detail)
         case let .planProposed(plan):
             pendingPlan = plan
+            let titles = plan.items.map { $0.title }.joined(separator: "、")
+            append(.notice, "提案 \(plan.items.count) 个事件：\(titles)")
         case let .planApplied(events):
             pendingPlan = nil
-            append(.assistant, "已写入 \(events.count) 个事件。")
+            append(.notice, "已写入 \(events.count) 个事件。")
         case let .memoriesChanged(text):
             memoryEntries = MemoryStore.loadRecovering().entries
             append(.notice, text)
@@ -284,7 +416,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func append(_ kind: Turn.Kind, _ text: String) {
-        turns.append(Turn(kind: kind, text: text))
+    private func append(_ kind: ChatTurn.Kind, _ text: String) {
+        turns.append(ChatTurn(kind: kind, text: text))
     }
 }

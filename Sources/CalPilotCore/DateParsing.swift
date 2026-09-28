@@ -277,12 +277,33 @@ public enum Format {
         return f.string(from: date)
     }
 
+    /// Turns the `EEE` form into the label the CLI and the window show.
+    public static func weekdayLabel(_ short: String) -> String {
+        switch short {
+        case "Mon": return "周一"
+        case "Tue": return "周二"
+        case "Wed": return "周三"
+        case "Thu": return "周四"
+        case "Fri": return "周五"
+        case "Sat": return "周六"
+        case "Sun": return "周日"
+        default: return short
+        }
+    }
+
     /// "1h 30m" style duration.
     public static func duration(minutes: Int) -> String {
         if minutes < 60 { return "\(minutes)m" }
         let h = minutes / 60
         let m = minutes % 60
         return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+    }
+
+    /// Aggregate hours, e.g. "3.5h" or "45m" for anything under an hour.
+    public static func hours(_ value: Double) -> String {
+        if value <= 0 { return "0h" }
+        if value < 1 { return String(format: "%.0fm", value * 60) }
+        return String(format: "%.1fh", value)
     }
 
     /// Compact elapsed time, used to tell the model how stale a conversation is.
@@ -299,16 +320,80 @@ public enum Format {
         return days == 1 ? "1 day" : "\(days) days"
     }
 
-    /// Parses "09:00" or "9:00-18:00".
+    /// Every clock time inside a string, in order. Lenient by design: annotations such as
+    /// `11:40-12:30（学校）` are ignored rather than invalidating the value. The previous
+    /// exact-match parser returned nil for that note, and the caller fell back to its
+    /// default — so writing a helpful note silently deleted the lunch break.
+    public static func clockTimes(in raw: String) -> [(hour: Int, minute: Int)] {
+        let pattern = #"(\d{1,2})\s*[:：]\s*(\d{1,2})"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return regex
+            .matches(in: raw, range: NSRange(raw.startIndex..., in: raw))
+            .compactMap { match in
+                guard let hourRange = Range(match.range(at: 1), in: raw),
+                      let minuteRange = Range(match.range(at: 2), in: raw),
+                      let hour = Int(raw[hourRange]),
+                      let minute = Int(raw[minuteRange]),
+                      (0...23).contains(hour),
+                      (0...59).contains(minute)
+                else { return nil }
+                return (hour, minute)
+            }
+    }
+
+    /// A single clock time, e.g. `07:40` or `7:40`.
+    public static func parseClock(_ raw: String) -> (hour: Int, minute: Int)? {
+        clockTimes(in: raw).first
+    }
+
+    /// A clock range: `09:00-18:00`, `9:00 – 18:00`, `07:40~21:00`, `11:40-12:30（学校）`.
     public static func parseClockRange(_ raw: String) -> (start: (Int, Int), end: (Int, Int))? {
-        let parts = raw.split(separator: "-").map { $0.trimmingCharacters(in: .whitespaces) }
-        guard parts.count == 2 else { return nil }
-        func parse(_ s: String) -> (Int, Int)? {
-            let hm = s.split(separator: ":")
-            guard hm.count == 2, let h = Int(hm[0]), let m = Int(hm[1]) else { return nil }
-            return (h, m)
+        let times = clockTimes(in: raw)
+        guard times.count >= 2 else { return nil }
+        return ((times[0].hour, times[0].minute), (times[1].hour, times[1].minute))
+    }
+
+    /// Weekday numbers are `Calendar`'s: 1 = Sunday … 7 = Saturday.
+    public static func weekdayShortName(_ weekday: Int) -> String {
+        switch weekday {
+        case 1: return "周日"
+        case 2: return "周一"
+        case 3: return "周二"
+        case 4: return "周三"
+        case 5: return "周四"
+        case 6: return "周五"
+        case 7: return "周六"
+        default: return "?"
         }
-        guard let a = parse(parts[0]), let b = parse(parts[1]) else { return nil }
-        return (a, b)
+    }
+
+    /// Collapses a weekday set into something readable: `每天`, `周一–周五`, `周一、周三、周六`.
+    public static func describeDays(_ days: [Int]) -> String {
+        let unique = Array(Set(days)).filter { (1...7).contains($0) }.sorted()
+        if unique.isEmpty || unique.count == 7 { return "每天" }
+
+        // Rotate Friday/Saturday/Sunday into a Monday-first run so the wrap joins up.
+        var ordered = unique
+        if let first = ordered.first, let last = ordered.last, first == 1, last == 7 {
+            ordered = ordered.filter { $0 != 1 } + [8]  // treat Sunday as "day 8"
+        }
+
+        var runs: [[Int]] = []
+        for day in ordered {
+            if let last = runs.last?.last, day == last + 1 {
+                runs[runs.count - 1].append(day)
+            } else {
+                runs.append([day])
+            }
+        }
+
+        func label(_ value: Int) -> String { weekdayShortName(value == 8 ? 1 : value) }
+
+        return runs.map { run -> String in
+            guard let first = run.first, let last = run.last else { return "" }
+            if run.count == 1 { return label(first) }
+            if run.count == 2 { return "\(label(first))、\(label(last))" }
+            return "\(label(first))–\(label(last))"
+        }.joined(separator: "、")
     }
 }

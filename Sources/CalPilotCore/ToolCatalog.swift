@@ -36,7 +36,10 @@ public enum ToolCatalog {
     public static let definitions: [LLMClient.ToolDefinition] = [
         LLMClient.ToolDefinition(
             name: "list_events",
-            description: "List the events that already exist so you know what is immovable.",
+            description: """
+            List existing events in a window. Use it to see what is immovable, and pass a \
+            past `from`/`to` to look at history.
+            """,
             parameters: .obj([
                 "type": .string("object"),
                 "properties": .obj([
@@ -49,8 +52,39 @@ public enum ToolCatalog {
             ])
         ),
         LLMClient.ToolDefinition(
+            name: "calendar_analysis",
+            description: """
+            Aggregate statistics over a past window: hours per calendar, average load per \
+            weekday, busiest days, how much of the working day is booked, and how fragmented \
+            the free time is. Use this instead of guessing when the user asks how their time \
+            was spent, whether a week was busy, or where the hours went.
+            """,
+            parameters: .obj([
+                "type": .string("object"),
+                "properties": .obj([
+                    "lookback_days": .obj([
+                        "type": .string("integer"),
+                        "description": .string("How many days back from now to analyse. Defaults to 30."),
+                    ]),
+                    "from": .obj([
+                        "type": .string("string"),
+                        "description": .string("Explicit window start, overriding lookback_days."),
+                    ]),
+                    "to": .obj([
+                        "type": .string("string"),
+                        "description": .string("Explicit window end. Defaults to now."),
+                    ]),
+                    "calendar": .obj([
+                        "type": .string("string"),
+                        "description": .string("Limit the analysis to one calendar."),
+                    ]),
+                ]),
+                "required": .array([]),
+            ])
+        ),
+        LLMClient.ToolDefinition(
             name: "find_free_slots",
-            description: "Return the free slots inside working hours, with buffers already applied.",
+            description: "Return the free slots inside the user's available hours, with buffers already applied.",
             parameters: .obj([
                 "type": .string("object"),
                 "properties": .obj([
@@ -190,6 +224,8 @@ public enum ToolCatalog {
         switch name {
         case "list_events":
             return try listEvents(arguments: arguments, context: context)
+        case "calendar_analysis":
+            return try calendarAnalysis(arguments: arguments, context: context)
         case "find_free_slots":
             return try findFreeSlots(arguments: arguments, context: context)
         case "propose_plan":
@@ -278,12 +314,53 @@ public enum ToolCatalog {
         }
         let result = JSONValue.obj([
             "timeZone": .string(config.timeZone),
-            "workingHours": .string("\(config.workDayStart)-\(config.workDayEnd)"),
+            "availableHours": .string(config.availabilitySummary),
             "bufferMinutes": .number(Double(config.bufferMinutes)),
             "maxEventsPerDay": .number(Double(config.maxEventsPerDay)),
             "freeSlots": .array(payload),
         ])
         return Agent.Outcome(content: result.jsonString)
+    }
+
+    private static func calendarAnalysis(arguments: [String: JSONValue], context: Context) throws -> Agent.Outcome {
+        let config = context.config
+        // Analysis looks backwards: `lookback_days` counts back from now.
+        let lookback = max(1, arguments["lookback_days"]?.intValue ?? arguments["days"]?.intValue ?? 30)
+        let end: Date
+        if let raw = arguments["to"]?.stringValue, !raw.isEmpty {
+            end = try FlexibleDate.parse(raw, calendar: config.calendar, now: context.now)
+        } else {
+            end = context.now
+        }
+        let start: Date
+        if let raw = arguments["from"]?.stringValue, !raw.isEmpty {
+            start = try FlexibleDate.parse(raw, calendar: config.calendar, now: context.now)
+        } else {
+            start = config.calendar.date(byAdding: .day, value: -lookback, to: end) ?? end.addingTimeInterval(-Double(lookback) * 86_400)
+        }
+        guard end > start else {
+            return Agent.Outcome(content: #"{"error": "the analysis window ends before it starts"}"#)
+        }
+
+        var ids: [String]? = nil
+        if let name = arguments["calendar"]?.stringValue,
+           let match = context.service.findCalendar(named: name) {
+            ids = [match.calendarIdentifier]
+        }
+
+        let events = context.service.events(from: start, to: end, calendarIDs: ids)
+        let analysis = CalendarAnalyzer.analyze(
+            events: events,
+            config: config,
+            rangeStart: start,
+            rangeEnd: end
+        )
+        guard let data = try? CalPilotJSON.encoder(pretty: false).encode(analysis),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return Agent.Outcome(content: #"{"error": "could not encode the analysis"}"#)
+        }
+        return Agent.Outcome(content: json)
     }
 
     private static func listMemories(context: Context) -> Agent.Outcome {
@@ -421,6 +498,11 @@ public enum ToolCatalog {
             let from = arguments["from"]?.stringValue ?? "now"
             let to = arguments["to"]?.stringValue ?? "+\(arguments["days"]?.intValue ?? 7)d"
             return "\(name)(\(from) → \(to))"
+        case "calendar_analysis":
+            let from = arguments["from"]?.stringValue
+                ?? "last \(arguments["lookback_days"]?.intValue ?? 30)d"
+            let to = arguments["to"]?.stringValue ?? "now"
+            return "calendar_analysis(\(from) → \(to))"
         case "propose_plan":
             let count = arguments["events"]?.arrayValue?.count ?? 0
             return "propose_plan(\(count) event\(count == 1 ? "" : "s"))"
@@ -441,6 +523,10 @@ public enum ToolCatalog {
         case "list_events":
             let count = value["events"]?.arrayValue?.count ?? 0
             return "\(count) event(s)"
+        case "calendar_analysis":
+            let total = value["totalEvents"]?.intValue ?? 0
+            let utilization = value["utilization"]?.numberValue ?? 0
+            return "\(total) event(s) analysed, available hours \(Int((utilization * 100).rounded()))% booked"
         case "find_free_slots":
             let slots = value["freeSlots"]?.arrayValue ?? []
             let minutes = slots.compactMap { $0["minutes"]?.intValue }.reduce(0, +)

@@ -60,6 +60,14 @@ public enum JSONValue: Codable, Equatable {
         }
     }
 
+    public var numberValue: Double? {
+        switch self {
+        case let .number(value): return value
+        case let .string(value): return Double(value)
+        default: return nil
+        }
+    }
+
     public var boolValue: Bool? {
         switch self {
         case let .bool(value): return value

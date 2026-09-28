@@ -50,10 +50,21 @@ Contents/MacOS/CalPilot        the SwiftUI window (double-click this)
 Contents/MacOS/calpilot-cli    the command line tool bin/calpilot execs
 ```
 
-The window is a thin shell over the same engine: calendar sidebar, transcript with tool
-calls, a proposal card with **写入 / 放弃**, and settings for the model, work hours, and
-the memory block. Every guard rail applies here too — proposals are validated locally and
-nothing is written until you press the button.
+The window is a thin shell over the same engine: a conversation list in the title bar, a
+transcript with tool calls, a sidebar that switches between the coming week and an analysis
+of the past, a proposal card with **写入 / 放弃**, and settings for the model, availability
+rules, and the memory block. Every guard rail applies here too — proposals are validated
+locally and nothing is written until you press the button.
+
+### The keychain is per binary
+
+The window and `bin/calpilot` are two different executables, and macOS grants keychain
+access per binary rather than per bundle. Whichever one did *not* save the key will ask for
+permission the first time it reads it — choose **Always Allow** and it asks only once.
+
+Because the request blocks until it is answered, the command line prints a note explaining
+the wait before it happens. To bypass the keychain entirely, export `CALPILOT_API_KEY` or
+pass `--api-key`.
 
 ### Why a bundle instead of a plain binary
 
@@ -107,6 +118,21 @@ calpilot undo                                     # take the last batch back
 Every `plan` run is a dry run until `--apply`. `--offline` schedules without a language
 model, which is also how the engine is exercised without an API key.
 
+## Reviewing past time
+
+```bash
+calpilot analyze --days 30
+calpilot analyze --from 2026-09-01 --to 2026-10-01
+calpilot analyze --days 90 --json
+```
+
+Computed locally, so it costs no tokens and needs no API key. It reports hours per
+calendar, average and total load per weekday, the busiest days, how much of your available
+time is booked, how fragmented the free time is, and a few plain-language observations.
+
+The agent has the same numbers behind the `calendar_analysis` tool, so asking "我上个月时间
+都花哪了" in `chat` quotes real arithmetic rather than guessing.
+
 ## The agent
 
 ```bash
@@ -148,6 +174,27 @@ Commands inside the session: `/events`, `/free`, `/plan <goal>`, `/apply`, `/und
 
 Endpoints without native tool calling are detected and switched to a JSON protocol
 (`{"tool": ..., "arguments": ...}`) automatically.
+
+## Conversation persistence
+
+Conversations are saved after every turn to `~/.config/calpilot/sessions/`, one JSON file
+each so a single corrupt file cannot take the history with it.
+
+```bash
+calpilot sessions list
+calpilot sessions show 3f9ac2b1
+calpilot sessions remove 3f9ac2b1
+calpilot chat --resume 3f9ac2b1
+```
+
+Each file stores two views of the same exchange: the visible turns, and the model's real
+transcript including tool calls and their results. Resuming restores the second one, so the
+agent keeps its context instead of starting over. The system prompt itself is *not*
+restored verbatim — it is rebuilt from the current config and memory on the next turn, so a
+preference you added since the session was saved still applies.
+
+The window lists your conversations in the title-bar menu; the same files back both
+interfaces, so a conversation started in the terminal can be continued in the window.
 
 ## Personal memory block
 
@@ -200,6 +247,33 @@ cache is working:
 calpilot chat --goal "安排这周" --once
 ```
 
+## Availability rules
+
+CalPilot only schedules into hours you declare. The original shape was a work week — one
+weekday window plus a lunch break — which does not fit school, shift work, or any week whose
+days differ. So the window is now a list of rules, grouped by weekday:
+
+```bash
+calpilot schedule show
+calpilot schedule preset school          # a starting point you then edit
+calpilot schedule add --days mon,tue,wed,thu,fri --start 07:40 --end 21:00 \
+    --break 11:40-12:30 --break 17:00-18:00
+calpilot schedule add --days sat,sun --start 10:00 --end 18:00
+calpilot schedule remove 1
+calpilot schedule clear                  # back to the single legacy window
+```
+
+Rules are unioned when they overlap, and each rule's breaks are subtracted. Weekdays are
+given by name (`mon`, `周一`, `每天`) rather than by number, because "1" means Monday to most
+people and Sunday to `Calendar`. The window's Settings panel edits the same rules.
+
+Breaks tolerate annotations: `11:40-12:30（学校）` parses. It did not before, and a note in
+that field silently deleted the break — so unreadable values are now reported instead of
+ignored (`calpilot doctor`, `plan`, and the window all say so).
+
+The legacy `workDayStart` / `workDayEnd` / `workDays` / `lunchBreak` fields still work and
+are used when no rules exist.
+
 ## Configuration
 
 `~/.config/calpilot/config.json`
@@ -213,13 +287,13 @@ calpilot chat --goal "安排这周" --once
   "writeCalendar": "CalPilot",
   "autoCreateCalendar": true,
   "timeZone": "Asia/Shanghai",
-  "workDayStart": "09:00",
-  "workDayEnd": "18:00",
-  "workDays": [2, 3, 4, 5, 6],
+  "schedule": [
+    { "days": [2, 3, 4, 5, 6], "start": "07:40", "end": "21:00", "breaks": ["11:40-12:30"] },
+    { "days": [1, 7], "start": "10:00", "end": "18:00", "breaks": [] }
+  ],
   "defaultEventMinutes": 60,
   "bufferMinutes": 10,
   "maxEventsPerDay": 4,
-  "lunchBreak": "12:00-13:00",
   "extraInstructions": ""
 }
 ```
@@ -228,9 +302,10 @@ calpilot chat --goal "安排这周" --once
 
 ```bash
 calpilot config set --model deepseek-chat --base-url https://api.deepseek.com/v1
-calpilot config set --work-day-start 10:00 --work-day-end 19:00 --buffer-minutes 15
-calpilot config set --lunch-break none
+calpilot config set --buffer-minutes 15 --max-events-per-day 3
 ```
+
+Weekday numbers in `days` follow `Calendar`: 1 = Sunday … 7 = Saturday.
 
 The API key resolves in this order: `--api-key`, `CALPILOT_API_KEY`, the environment
 variable named by `apiKeyEnv`, then the keychain entry for the endpoint's host.
@@ -238,8 +313,13 @@ variable named by `apiKeyEnv`, then the keychain entry for the endpoint's host.
 ## Checks
 
 ```bash
-calpilot selftest     # 51 checks: date parsing, slots, plan validation, memory, cache stability, agent loop
+calpilot selftest     # 100 checks
 ```
+
+Date parsing, availability rules, free slots, plan validation, past-time analysis, session
+round-trips (including the disk path), the personal memory block, prompt-cache byte
+stability, recovery of a resumed conversation, and an offline turn loop driven by a
+scripted client.
 
 ## Layout
 
@@ -251,6 +331,8 @@ Sources/CalPilotCore/     engine (no UI)
   Agent.swift               turn-based loop, stable prompts, usage accounting
   ToolCatalog.swift         agent tools and their schemas
   Memory.swift              personal memory block
+  Sessions.swift            saved conversations (visible turns + model transcript)
+  CalendarAnalysis.swift    deterministic past-time statistics
   PlanApplier.swift         the only writer; journals everything
   LLMClient.swift           OpenAI-compatible client, tools, cache-aware encoding
 Sources/calpilot/         CLI
@@ -263,6 +345,8 @@ scripts/build-app.sh      bundle assembly
 ## Known limits
 
 - Repeating events are read as-is; CalPilot only creates single events.
+- Analysis counts time inside your declared availability only, so a class outside those
+  hours still shows up in the event list but not in the utilisation figure.
 - EventKit cannot force a sync, so a freshly written event may take a moment to reach
   other devices.
 - Calendar permission for a rebuilt unsigned bundle depends on the path staying the same;

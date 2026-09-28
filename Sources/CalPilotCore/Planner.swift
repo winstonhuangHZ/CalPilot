@@ -164,7 +164,7 @@ public struct Planner {
         Hard rules:
         1. Every proposed event must lie entirely inside one of the provided free slots.
         2. Never overlap two proposed events, and never touch an existing busy block.
-        3. Respect the working hours, working days, buffer minutes, and the per-day event cap.
+        3. Respect the available hours, buffer minutes, and the per-day event cap.
         4. Respect the requested duration for each task; never shorten a task below its request.
         5. Prefer the earliest suitable slot unless the preferences or the task's nature argue otherwise.
         6. Leave reasoning short: one sentence per event in "reason".
@@ -210,8 +210,7 @@ public struct Planner {
         lines.append("Now: \(Format.iso(context.now, calendar: config.calendar))")
         lines.append("Time zone: \(config.timeZone)")
         lines.append("Planning window: \(Format.iso(request.rangeStart, calendar: config.calendar)) → \(Format.iso(request.rangeEnd, calendar: config.calendar))")
-        lines.append("Working days: \(workDayDescription())")
-        lines.append("Working hours: \(config.workDayStart)-\(config.workDayEnd)\(config.lunchBreak.map { ", lunch \($0)" } ?? "")")
+        lines.append("Available hours: \(config.availabilitySummary)")
         lines.append("Buffer between events: \(config.bufferMinutes) minutes")
         lines.append("The free slots below already have that buffer applied, so use them as-is.")
         lines.append("Maximum new events per day: \(config.maxEventsPerDay)")
@@ -258,13 +257,6 @@ public struct Planner {
         lines.append("")
         lines.append("Return the JSON plan now.")
         return lines.joined(separator: "\n")
-    }
-
-    private func workDayDescription() -> String {
-        let names = [1: "Sun", 2: "Mon", 3: "Tue", 4: "Wed", 5: "Thu", 6: "Fri", 7: "Sat"]
-        let sorted = config.workDays.sorted()
-        if sorted.count == 7 { return "every day" }
-        return sorted.compactMap { names[$0] }.joined(separator: ", ")
     }
 
     // MARK: - LLM plan

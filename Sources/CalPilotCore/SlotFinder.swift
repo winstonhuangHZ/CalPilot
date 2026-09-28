@@ -1,45 +1,36 @@
 import Foundation
 
-/// Computes working windows and free slots, and snaps desired times into gaps.
+/// Computes the hours you are willing to have something scheduled into, and the free gaps
+/// inside them.
+///
+/// The window comes from `AppConfig.effectiveSchedule`, which supports several rules so a
+/// weekday that runs late and a weekend that starts late are both expressible. Rules that
+/// match the same day are unioned, and each rule's breaks are subtracted.
 public struct SlotFinder {
     public let calendar: Calendar
-    public let workDays: Set<Int>
-    public let dayStart: (hour: Int, minute: Int)
-    public let dayEnd: (hour: Int, minute: Int)
-    public let lunch: (start: (hour: Int, minute: Int), end: (hour: Int, minute: Int))?
+    public let rules: [ScheduleRule]
     public let bufferMinutes: Int
 
     public init(config: AppConfig) {
         self.calendar = config.calendar
-        self.workDays = Set(config.workDays)
-        let range = Format.parseClockRange("\(config.workDayStart)-\(config.workDayEnd)")
-        self.dayStart = range?.start ?? (9, 0)
-        self.dayEnd = range?.end ?? (18, 0)
-        if let lunchRaw = config.lunchBreak, let parsed = Format.parseClockRange(lunchRaw) {
-            self.lunch = (parsed.start, parsed.end)
-        } else {
-            self.lunch = nil
-        }
+        self.rules = config.effectiveSchedule
         self.bufferMinutes = max(0, config.bufferMinutes)
     }
 
     // MARK: - Windows
 
-    /// All working windows (work hours minus lunch) between two instants.
-    public func workingWindows(from start: Date, to end: Date) -> [DateInterval] {
+    /// Every available window between two instants, clipped to the range.
+    public func availableWindows(from start: Date, to end: Date) -> [DateInterval] {
         var windows: [DateInterval] = []
         var day = calendar.startOfDay(for: start)
         let lastDay = calendar.startOfDay(for: end)
 
         while day <= lastDay {
-            let weekday = calendar.component(.weekday, from: day)
-            if workDays.isEmpty || workDays.contains(weekday) {
-                for window in dayWindows(on: day) {
-                    let clippedStart = max(window.start, start)
-                    let clippedEnd = min(window.end, end)
-                    if clippedEnd > clippedStart {
-                        windows.append(DateInterval(start: clippedStart, end: clippedEnd))
-                    }
+            for window in dayWindows(on: day) {
+                let clippedStart = max(window.start, start)
+                let clippedEnd = min(window.end, end)
+                if clippedEnd > clippedStart {
+                    windows.append(DateInterval(start: clippedStart, end: clippedEnd))
                 }
             }
             guard let next = calendar.date(byAdding: .day, value: 1, to: day) else { break }
@@ -48,24 +39,57 @@ public struct SlotFinder {
         return windows
     }
 
+    /// The windows for one calendar day, with breaks removed.
     private func dayWindows(on day: Date) -> [DateInterval] {
-        func instant(_ hm: (hour: Int, minute: Int)) -> Date? {
-            var comps = calendar.dateComponents([.year, .month, .day], from: day)
-            comps.hour = hm.hour
-            comps.minute = hm.minute
-            comps.second = 0
-            return calendar.date(from: comps)
+        let weekday = calendar.component(.weekday, from: day)
+        let matching = rules.filter { $0.days.isEmpty || $0.days.contains(weekday) }
+        var windows: [DateInterval] = []
+
+        for rule in matching {
+            guard let start = instant(rule.start, on: day),
+                  let end = instant(rule.end, on: day),
+                  end > start
+            else { continue }
+
+            var pieces = [DateInterval(start: start, end: end)]
+            for entry in rule.breaks {
+                guard let range = Format.parseClockRange(entry),
+                      let breakStart = instant(range.start, on: day),
+                      let breakEnd = instant(range.end, on: day),
+                      breakEnd > breakStart
+                else { continue }
+                pieces = pieces.flatMap { subtract($0, from: breakStart, to: breakEnd) }
+            }
+            windows.append(contentsOf: pieces)
         }
-        guard let start = instant(dayStart), let end = instant(dayEnd), end > start else { return [] }
-        guard let lunch, let lunchStart = instant(lunch.start), let lunchEnd = instant(lunch.end),
-              lunchEnd > lunchStart, lunchStart > start, lunchEnd < end
-        else {
-            return [DateInterval(start: start, end: end)]
+
+        // Union overlapping rules so a broad rule plus a narrow one cannot double-count.
+        return Self.merge(windows)
+    }
+
+    private func instant(_ clock: (hour: Int, minute: Int), on day: Date) -> Date? {
+        var comps = calendar.dateComponents([.year, .month, .day], from: day)
+        comps.hour = clock.hour
+        comps.minute = clock.minute
+        comps.second = 0
+        return calendar.date(from: comps)
+    }
+
+    private func instant(_ text: String, on day: Date) -> Date? {
+        guard let clock = Format.parseClock(text) else { return nil }
+        return instant(clock, on: day)
+    }
+
+    private func subtract(_ interval: DateInterval, from cutStart: Date, to cutEnd: Date) -> [DateInterval] {
+        guard cutEnd > interval.start, cutStart < interval.end else { return [interval] }
+        var pieces: [DateInterval] = []
+        if cutStart > interval.start {
+            pieces.append(DateInterval(start: interval.start, end: min(cutStart, interval.end)))
         }
-        return [
-            DateInterval(start: start, end: lunchStart),
-            DateInterval(start: lunchEnd, end: end),
-        ]
+        if cutEnd < interval.end {
+            pieces.append(DateInterval(start: max(cutEnd, interval.start), end: interval.end))
+        }
+        return pieces.filter { $0.duration > 0 }
     }
 
     // MARK: - Free slots
@@ -77,12 +101,11 @@ public struct SlotFinder {
         minMinutes: Int = 30
     ) -> [FreeSlot] {
         // Inflating the busy blocks by the buffer means the padding is only applied at
-        // event boundaries, never against the edges of the working day.
+        // event boundaries, never against the edges of the day.
         let merged = Self.merge(Self.inflate(busy, by: TimeInterval(bufferMinutes * 60)))
-        let windows = workingWindows(from: start, to: end)
         var slots: [FreeSlot] = []
 
-        for window in windows {
+        for window in availableWindows(from: start, to: end) {
             var cursor = window.start
             for block in merged where block.end > window.start && block.start < window.end {
                 if block.start > cursor {
@@ -118,8 +141,8 @@ public struct SlotFinder {
     }
 
     /// Finds a home for a desired booking: keeps the requested time when it fits,
-    /// otherwise moves it to the nearest free slot on the same day, then the next
-    /// available day inside the range.
+    /// otherwise moves it to the nearest free slot on the same day, then the nearest slot
+    /// on any other day inside the range.
     public func snap(
         desiredStart: Date,
         minutes: Int,
@@ -153,7 +176,7 @@ public struct SlotFinder {
     public func fits(start: Date, end: Date, busy: [DateInterval], rangeStart: Date, rangeEnd: Date) -> Bool {
         guard end > start else { return false }
         guard start >= rangeStart, end <= rangeEnd else { return false }
-        guard isInsideWorkingWindow(start: start, end: end) else { return false }
+        guard isInsideAvailableWindow(start: start, end: end) else { return false }
         let padded = Self.inflate(busy, by: TimeInterval(bufferMinutes * 60))
         for block in padded where block.start < end && block.end > start {
             return false
@@ -161,7 +184,7 @@ public struct SlotFinder {
         return true
     }
 
-    public func isInsideWorkingWindow(start: Date, end: Date) -> Bool {
+    public func isInsideAvailableWindow(start: Date, end: Date) -> Bool {
         let day = calendar.startOfDay(for: start)
         return dayWindows(on: day).contains { start >= $0.start && end <= $0.end }
     }

@@ -66,6 +66,11 @@ struct PlanCommand: AsyncParsableCommand {
         let config = try Runtime.loadConfig()
         let service = try await Runtime.connectedService(config: config)
         let planner = Planner(config: config, service: service, memory: MemoryStore.loadRecovering())
+        if !json {
+            for warning in config.schedulingWarnings {
+                Console.warn(warning)
+            }
+        }
 
         let range = try Runtime.resolveRange(
             from: from, to: to, days: days, defaultStartFromNow: true, config: config
@@ -94,7 +99,11 @@ struct PlanCommand: AsyncParsableCommand {
             }
             plan = planner.planHeuristically(request: request)
         } else {
-            guard let resolved = Credentials.resolveAPIKey(config: config, explicit: apiKey) else {
+            guard let resolved = Credentials.resolveAPIKey(
+                config: config,
+                explicit: apiKey,
+                keychainHint: { KeychainHint.announce() }
+            ) else {
                 throw CLIError("""
                 No API key found. Store one with `calpilot config set-key <key>`, export \
                 CALPILOT_API_KEY (or \(config.apiKeyEnv)), or use `--offline` to schedule \

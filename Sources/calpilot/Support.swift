@@ -99,7 +99,7 @@ enum PlanRenderer {
 
         Console.heading("Free slots")
         if context.freeSlots.isEmpty {
-            Console.warn("no free slot inside working hours in this window")
+            Console.warn("no free slot inside the available hours in this window")
         } else if verbose {
             let rows = context.freeSlots.map { slot in
                 [

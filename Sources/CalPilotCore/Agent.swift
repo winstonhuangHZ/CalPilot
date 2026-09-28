@@ -29,6 +29,32 @@ public final class Agent {
         case jsonProtocol
     }
 
+    /// Everything needed to write a conversation to disk and pick it up later.
+    ///
+    /// The model transcript is stored rather than replayed from the visible turns: tool
+    /// calls and their results are part of the context, and rebuilding them from the
+    /// rendered lines would lose both the fidelity and the cacheable prefix.
+    public struct State: Codable {
+        public var messages: [LLMClient.Message]
+        public var pendingPlan: Plan?
+        public var lastUserTurnAt: Date?
+        public var usage: LLMClient.TokenUsage
+
+        public init(
+            messages: [LLMClient.Message] = [],
+            pendingPlan: Plan? = nil,
+            lastUserTurnAt: Date? = nil,
+            usage: LLMClient.TokenUsage = LLMClient.TokenUsage()
+        ) {
+            self.messages = messages
+            self.pendingPlan = pendingPlan
+            self.lastUserTurnAt = lastUserTurnAt
+            self.usage = usage
+        }
+
+        public var isEmpty: Bool { messages.isEmpty }
+    }
+
     public let config: AppConfig
     public let service: CalendarService
     public let client: any LLMChatClient
@@ -80,6 +106,31 @@ public final class Agent {
     }
 
     public var transcript: [LLMClient.Message] { messages }
+
+    // MARK: - Persistence
+
+    public func exportState() -> State {
+        State(
+            messages: messages,
+            pendingPlan: pendingPlan,
+            lastUserTurnAt: lastUserTurnAt,
+            usage: usageTotals
+        )
+    }
+
+    /// Restores a stored conversation. The system message is deliberately *not* restored
+    /// verbatim — `installedSystemSignature` is cleared so the next turn rebuilds it from
+    /// the current config and memory, which may have changed since the session was saved.
+    public func restore(_ state: State) {
+        messages = state.messages
+        pendingPlan = state.pendingPlan
+        lastUserTurnAt = state.lastUserTurnAt
+        usageTotals = state.usage
+        installedSystemSignature = nil
+        if messages.first?.role != "system" {
+            installSystemPromptIfNeeded(force: true)
+        }
+    }
 
     public var cacheSummary: String {
         guard let ratio = usageTotals.cacheHitRatio else {
@@ -258,24 +309,26 @@ public final class Agent {
         Rules:
         1. Never invent calendar contents. Call `list_events` or `find_free_slots` first.
         2. Every event you propose must come from the free slots the tools reported.
-        3. Only `propose_plan` creates a proposal, and only `apply_plan` writes it. The user
+        3. When the user asks how their time was spent, how busy a period was, or where the
+           hours went, call `calendar_analysis` and quote its numbers. Never estimate from
+           the conversation.
+        4. Only `propose_plan` creates a proposal, and only `apply_plan` writes it. The user
            always confirms a write, so never claim an event was created until `apply_plan`
            returns successfully.
-        4. When the user changes their mind, call `propose_plan` again with the full,
+        5. When the user changes their mind, call `propose_plan` again with the full,
            corrected plan — a new proposal replaces the previous one.
-        5. Call `remember` whenever the user states a durable preference or constraint,
+        6. Call `remember` whenever the user states a durable preference or constraint,
            then confirm it in one short sentence.
-        6. Ask a clarifying question with `answer` only when the request is truly ambiguous;
+        7. Ask a clarifying question with `answer` only when the request is truly ambiguous;
            otherwise make a sensible choice and say so.
-        7. Keep replies short. Use the user's language.
-        8. After a successful `apply_plan`, state the count and mention that `calpilot undo`
+        8. Keep replies short. Use the user's language.
+        9. After a successful `apply_plan`, state the count and mention that `calpilot undo`
            can take it back.
         """)
         lines.append("")
         lines.append("## Defaults (stable for the whole session)")
         lines.append("Time zone: \(config.timeZone)")
-        lines.append("Working hours: \(config.workDayStart)-\(config.workDayEnd)\(config.lunchBreak.map { ", lunch \($0)" } ?? "")")
-        lines.append("Working days: \(workDayDescription())")
+        lines.append("Available hours: \(config.availabilitySummary)")
         lines.append("Buffer between events: \(config.bufferMinutes) minutes (already applied to every free slot the tools report)")
         lines.append("Maximum new events per day: \(config.maxEventsPerDay)")
         lines.append("Default task length: \(config.defaultEventMinutes) minutes")
@@ -293,13 +346,6 @@ public final class Agent {
             lines.append(ToolCatalog.jsonProtocolInstructions)
         }
         return lines.joined(separator: "\n")
-    }
-
-    private func workDayDescription() -> String {
-        let names = [1: "Sun", 2: "Mon", 3: "Tue", 4: "Wed", 5: "Thu", 6: "Fri", 7: "Sat"]
-        let sorted = config.workDays.sorted()
-        if sorted.count == 7 { return "every day" }
-        return sorted.compactMap { names[$0] }.joined(separator: ", ")
     }
 
     // MARK: - Tool execution

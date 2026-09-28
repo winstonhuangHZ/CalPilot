@@ -2,6 +2,64 @@ import ArgumentParser
 import CalPilotCore
 import Foundation
 
+/// Collects the visible turns and the model transcript of a conversation and writes them
+/// to disk after every turn, so an interrupted session is never lost.
+final class SessionRecorder {
+    private(set) var session: ChatSession
+
+    init(_ session: ChatSession) {
+        self.session = session
+    }
+
+    var id: UUID { session.id }
+    var isNew: Bool { session.turns.isEmpty }
+
+    func record(_ event: Agent.Event, at date: Date = Date()) {
+        switch event {
+        case let .assistantText(text):
+            append(.assistant, text, at: date)
+        case let .toolCall(_, summary):
+            append(.tool, summary, at: date)
+        case let .toolResult(_, detail):
+            append(.toolResult, detail, at: date)
+        case let .planProposed(plan):
+            let titles = plan.items.map { $0.title }.joined(separator: "、")
+            append(.notice, "提案 \(plan.items.count) 个事件：\(titles)", at: date)
+        case let .planApplied(events):
+            append(.notice, "已写入 \(events.count) 个事件", at: date)
+        case let .memoriesChanged(text):
+            append(.notice, text, at: date)
+        case let .notice(text):
+            append(.notice, text, at: date)
+        }
+    }
+
+    func append(_ kind: ChatTurn.Kind, _ text: String, at date: Date = Date()) {
+        session.turns.append(ChatTurn(kind: kind, text: text, at: date))
+        if !session.titleIsManual {
+            session.title = ChatSession.suggestedTitle(from: session.turns)
+        }
+    }
+
+    func rename(_ title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        session.title = trimmed
+        session.titleIsManual = true
+    }
+
+    /// Snapshot the agent and flush. Best effort: a failed write must not kill the session.
+    func persist(agent: Agent) {
+        session.agent = agent.exportState()
+        session.updatedAt = Date()
+        do {
+            try SessionStore.save(session)
+        } catch {
+            Console.warn("could not save the conversation: \(error)")
+        }
+    }
+}
+
 /// The turn-based interface: one line in, one agent turn out.
 struct ChatCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -9,7 +67,8 @@ struct ChatCommand: AsyncParsableCommand {
         abstract: "Talk to the scheduling agent, turn by turn.",
         discussion: """
         Every reply is one turn. The agent inspects your real calendar, proposes plans, and
-        only writes them after you confirm. Type /help inside the session for commands.
+        only writes them after you confirm. Conversations are saved as you go, so
+        `--resume` picks one up. Type /help inside the session for commands.
         """
     )
 
@@ -18,6 +77,9 @@ struct ChatCommand: AsyncParsableCommand {
 
     @Flag(name: .long, help: "Run only the first turn (with --goal) and exit.")
     var once = false
+
+    @Option(name: .long, help: "Continue a saved conversation, by id or unique id prefix.")
+    var resume: String?
 
     @Option(name: .long, help: "Language model override.")
     var model: String?
@@ -31,7 +93,11 @@ struct ChatCommand: AsyncParsableCommand {
     func run() async throws {
         let config = try Runtime.loadConfig()
         let service = try await Runtime.connectedService(config: config)
-        guard let resolved = Credentials.resolveAPIKey(config: config, explicit: apiKey) else {
+        guard let resolved = Credentials.resolveAPIKey(
+            config: config,
+            explicit: apiKey,
+            keychainHint: { KeychainHint.announce() }
+        ) else {
             throw CLIError("""
             No API key found. Store one with `calpilot config set-key <key>` or export \
             CALPILOT_API_KEY (or \(config.apiKeyEnv)).
@@ -40,24 +106,44 @@ struct ChatCommand: AsyncParsableCommand {
         let client = LLMClient(config: config, apiKey: resolved.key, model: model)
         let memory = noMemory ? MemoryStore() : MemoryStore.loadRecovering()
 
+        let restored: ChatSession?
+        if let resume {
+            guard let id = SessionStore.resolve(prefix: resume), let loaded = SessionStore.load(id: id) else {
+                throw CLIError("No saved conversation matches \"\(resume)\". Run `calpilot sessions list`.")
+            }
+            restored = loaded
+        } else {
+            restored = nil
+        }
+        let recorder = SessionRecorder(restored ?? ChatSession())
+
         let session = Agent(
             config: config,
             service: service,
             client: client,
             memory: memory,
             confirm: { Console.confirm($0, default: true) },
-            emit: { event in ChatRenderer.render(event, config: config) }
+            emit: { event in
+                recorder.record(event)
+                ChatRenderer.render(event, config: config)
+            }
         )
+        if let restored {
+            session.restore(restored.agent)
+        }
 
-        banner(config: config, service: service, client: client, memory: session.memory)
+        banner(config: config, service: service, client: client, memory: session.memory, recorder: recorder)
 
         if let goal {
             Console.note("\n  › \(goal)")
+            recorder.append(.user, goal)
             do {
                 try await session.send(goal)
             } catch {
+                recorder.append(.error, "\(error)")
                 Console.error("\(error)")
             }
+            recorder.persist(agent: session)
             if once { return }
         }
 
@@ -71,28 +157,49 @@ struct ChatCommand: AsyncParsableCommand {
             guard !input.isEmpty else { continue }
 
             if input.hasPrefix("/") {
-                if try await handleSlashCommand(input, session: session, config: config, service: service) {
+                if try await handleSlashCommand(
+                    input,
+                    session: session,
+                    recorder: recorder,
+                    config: config,
+                    service: service
+                ) {
                     break
                 }
+                recorder.persist(agent: session)
                 continue
             }
 
+            recorder.append(.user, input)
             do {
                 try await session.send(input)
             } catch {
+                recorder.append(.error, "\(error)")
                 Console.error("\(error)")
             }
+            recorder.persist(agent: session)
         }
 
+        recorder.persist(agent: session)
         Console.note("\nsession over · \(session.cacheSummary)")
+        Console.note("saved as \"\(recorder.session.title)\" · resume with `calpilot chat --resume \(String(recorder.id.uuidString.prefix(8)).lowercased())`")
     }
 
-    private func banner(config: AppConfig, service: CalendarService, client: LLMClient, memory: MemoryStore) {
-        Console.heading("CalPilot chat")
+    private func banner(
+        config: AppConfig,
+        service: CalendarService,
+        client: LLMClient,
+        memory: MemoryStore,
+        recorder: SessionRecorder
+    ) {
+        Console.heading(recorder.isNew ? "CalPilot chat" : "CalPilot chat · \(recorder.session.title)")
         Console.note("  model      \(client.modelName)  ·  \(config.baseURL)")
         Console.note("  calendars  \(service.calendarDTOs().count) visible, writing to \"\(config.writeCalendar)\"")
         Console.note("  memory     \(memory.entries.count) entr\(memory.entries.count == 1 ? "y" : "ies")\(memory.entries.isEmpty ? "" : " (\(memory.promptEntries().count) in every prompt)")")
-        Console.note("  hours      \(config.workDayStart)-\(config.workDayEnd), \(Format.duration(minutes: config.bufferMinutes)) buffer")
+        Console.note("  hours      \(config.availabilitySummary), \(Format.duration(minutes: config.bufferMinutes)) buffer")
+        if !recorder.isNew {
+            Console.note("  resumed    \(recorder.session.turns.count) turns from \(Format.human(recorder.session.updatedAt, calendar: config.calendar))")
+        }
         Console.note("\n  Type what you want scheduled. /help for commands, /exit to leave.")
         Console.note("  Any write is shown as a proposal first and asks for confirmation.\n")
     }
@@ -101,6 +208,7 @@ struct ChatCommand: AsyncParsableCommand {
     private func handleSlashCommand(
         _ input: String,
         session: Agent,
+        recorder: SessionRecorder,
         config: AppConfig,
         service: CalendarService
     ) async throws -> Bool {
@@ -115,8 +223,9 @@ struct ChatCommand: AsyncParsableCommand {
         case "help":
             print("""
 
-              /events [days]      list existing events (default 7 days)
+              /events [days]      list existing events from today
               /free [days]        list free slots (default 7 days)
+              /history [days]     summarise the last N days (default 30)
               /plan <goal>        ask the agent to draft a plan
               /apply              write the current proposal (asks first)
               /undo               remove the last batch CalPilot wrote
@@ -124,8 +233,10 @@ struct ChatCommand: AsyncParsableCommand {
               /memory <text>      remember a preference
               /pin <text>         remember a preference and pin it
               /forget <id>        delete a memory
+              /sessions           list saved conversations
+              /title <text>       rename this conversation
               /usage              token and prompt-cache statistics
-              /reset              start the conversation over (calendar untouched)
+              /reset              clear the model context (calendar untouched)
               /exit               leave
 
             """)
@@ -139,7 +250,7 @@ struct ChatCommand: AsyncParsableCommand {
                 rows: events.map { event in
                     [
                         Format.day(event.start, calendar: config.calendar),
-                        Format.weekday(event.start, calendar: config.calendar),
+                        Format.weekdayLabel(Format.weekday(event.start, calendar: config.calendar)),
                         event.isAllDay ? "all-day" : "\(Format.clock(event.start, calendar: config.calendar))-\(Format.clock(event.end, calendar: config.calendar))",
                         event.title,
                         event.calendarName,
@@ -162,18 +273,27 @@ struct ChatCommand: AsyncParsableCommand {
                 rows: slots.map { slot in
                     [
                         Format.day(slot.start, calendar: config.calendar),
-                        Format.weekday(slot.start, calendar: config.calendar),
+                        Format.weekdayLabel(Format.weekday(slot.start, calendar: config.calendar)),
                         "\(Format.clock(slot.start, calendar: config.calendar))-\(Format.clock(slot.end, calendar: config.calendar))",
                         Format.duration(minutes: slot.minutes),
                     ]
                 }
             )
 
+        case "history", "analyze":
+            let days = Int(argument) ?? 30
+            let end = Date()
+            let start = config.calendar.date(byAdding: .day, value: -days, to: end) ?? end.addingTimeInterval(-Double(days) * 86_400)
+            let events = service.events(from: start, to: end)
+            let analysis = CalendarAnalyzer.analyze(events: events, config: config, rangeStart: start, rangeEnd: end)
+            AnalyzeCommand.ReportRenderer.render(analysis, config: config)
+
         case "plan":
             guard !argument.isEmpty else {
                 Console.note("  usage: /plan <what you want scheduled>")
                 break
             }
+            recorder.append(.user, argument)
             try await session.send(argument)
 
         case "apply":
@@ -192,6 +312,7 @@ struct ChatCommand: AsyncParsableCommand {
                 source: "chat:/apply"
             )
             session.clearPendingPlan()
+            recorder.append(.notice, "已写入 \(created.count) 个事件")
             Console.success("\(created.count) event(s) written. `calpilot undo` takes them back.")
 
         case "undo":
@@ -238,6 +359,33 @@ struct ChatCommand: AsyncParsableCommand {
                 Console.note("  no memory matches \"\(argument)\"")
             }
 
+        case "sessions":
+            let saved = SessionStore.list()
+            guard !saved.isEmpty else {
+                Console.note("  no saved conversations")
+                break
+            }
+            Console.table(
+                headers: ["ID", "Updated", "Msgs", "Title", ""],
+                rows: saved.map { item in
+                    [
+                        String(item.id.uuidString.prefix(8)).lowercased(),
+                        Format.human(item.updatedAt, calendar: config.calendar),
+                        "\(item.messageCount)",
+                        item.title,
+                        item.id == recorder.id ? "current" : "",
+                    ]
+                }
+            )
+
+        case "title":
+            guard !argument.isEmpty else {
+                Console.note("  usage: /title <text>")
+                break
+            }
+            recorder.rename(argument)
+            Console.success("renamed to \"\(recorder.session.title)\"")
+
         case "usage":
             let usage = session.usageTotals
             Console.note("  input       \(usage.promptTokens.map(String.init) ?? "n/a")")
@@ -247,7 +395,7 @@ struct ChatCommand: AsyncParsableCommand {
 
         case "reset":
             session.reset()
-            Console.note("  conversation cleared (the calendar was not touched)")
+            Console.note("  model context cleared (the calendar and the saved transcript were not touched)")
 
         default:
             Console.note("  unknown command /\(command) — try /help")

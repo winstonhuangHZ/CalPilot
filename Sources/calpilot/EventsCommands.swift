@@ -232,7 +232,7 @@ struct EventsDeleteCommand: AsyncParsableCommand {
 struct FreeCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "free",
-        abstract: "Show the free slots inside working hours."
+        abstract: "Show the free slots inside your available hours."
     )
 
     @Option(name: .long, help: "Range start.")

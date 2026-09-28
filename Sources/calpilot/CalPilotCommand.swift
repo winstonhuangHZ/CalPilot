@@ -23,11 +23,14 @@ struct CalPilot: AsyncParsableCommand {
             CalendarsCommand.self,
             EventsCommand.self,
             FreeCommand.self,
+            AnalyzeCommand.self,
             PlanCommand.self,
             ChatCommand.self,
             ApplyCommand.self,
             UndoCommand.self,
+            SessionsCommand.self,
             MemoryCommand.self,
+            ScheduleCommand.self,
             ConfigCommand.self,
             SelfTestCommand.self,
         ],
@@ -52,8 +55,14 @@ struct DoctorCommand: AsyncParsableCommand {
         print("  config file   \(ConfigStore.configURL.path)")
         print("  journal       \(ConfigStore.journalURL.path)")
         print("  time zone     \(config.timeZone)")
-        print("  work hours    \(config.workDayStart)-\(config.workDayEnd)\(config.lunchBreak.map { ", lunch \($0)" } ?? "")")
+        print("  hours         \(config.availabilitySummary)")
+        if config.usesLegacySchedule {
+            Console.note("                (using the legacy single-window fields; see `calpilot schedule`)")
+        }
         print("  write target  \(config.writeCalendar)\(config.autoCreateCalendar ? " (created on demand)" : "")")
+        for warning in config.schedulingWarnings {
+            Console.warn(warning)
+        }
 
         Console.heading("Calendar access")
         let service = CalendarService()
@@ -83,7 +92,7 @@ struct DoctorCommand: AsyncParsableCommand {
         Console.heading("Language model")
         print("  endpoint      \(config.baseURL)\(config.chatPath)")
         print("  model         \(config.model)")
-        if let resolved = Credentials.resolveAPIKey(config: config) {
+        if let resolved = Credentials.resolveAPIKey(config: config, keychainHint: { KeychainHint.announce() }) {
             let masked = resolved.key.count > 8
                 ? "\(resolved.key.prefix(3))…\(resolved.key.suffix(4))"
                 : "…"
@@ -217,7 +226,7 @@ struct ConfigSetCommand: AsyncParsableCommand {
     @Option(name: .long) var timeZone: String?
     @Option(name: .long) var workDayStart: String?
     @Option(name: .long) var workDayEnd: String?
-    @Option(name: .long, help: "Weekdays as numbers 1=Sun … 7=Sat, e.g. 2,3,4,5,6")
+    @Option(name: .long, help: "Legacy single-window weekdays, numbers 1=Sun … 7=Sat. Prefer `calpilot schedule`.")
     var workDays: String?
     @Option(name: .long) var defaultEventMinutes: Int?
     @Option(name: .long) var bufferMinutes: Int?
@@ -254,11 +263,21 @@ struct ConfigSetCommand: AsyncParsableCommand {
         if let maxEventsPerDay { config.maxEventsPerDay = max(1, maxEventsPerDay) }
         if let lunchBreak {
             config.lunchBreak = (lunchBreak.lowercased() == "none" || lunchBreak.isEmpty) ? nil : lunchBreak
+            if let value = config.lunchBreak, Format.parseClockRange(value) == nil {
+                throw CLIError("--lunch-break must contain two times, e.g. 12:00-13:00. Got \"\(value)\".")
+            }
         }
         if let extraInstructions { config.extraInstructions = extraInstructions }
 
         guard Format.parseClockRange("\(config.workDayStart)-\(config.workDayEnd)") != nil else {
             throw CLIError("Working hours must look like 09:00-18:00.")
+        }
+        let touchedLegacyHours = workDayStart != nil || workDayEnd != nil || workDays != nil || lunchBreak != nil
+        if touchedLegacyHours, !config.usesLegacySchedule {
+            Console.warn("""
+            schedule 已经设置，workDayStart/workDayEnd/workDays/lunchBreak 不会生效。
+              用 `calpilot schedule show` 查看，或 `calpilot schedule clear` 回到旧字段。
+            """)
         }
         try ConfigStore.save(config)
         Console.success("saved \(ConfigStore.configURL.path)")

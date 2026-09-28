@@ -50,6 +50,22 @@ struct SelfTestCommand: AsyncParsableCommand {
                 expect(false, "\(input) -> threw \(error)")
             }
         }
+        let annotatedBreak = Format.parseClockRange("11:40-12:30（学校）")
+        expect(annotatedBreak != nil && annotatedBreak!.end.0 == 12 && annotatedBreak!.end.1 == 30,
+               "a lunch break with a note still parses (annotations are ignored)")
+        let enDash = Format.parseClockRange("9:00 – 18:00")
+        expect(enDash != nil && enDash!.start.0 == 9 && enDash!.start.1 == 0,
+               "en dashes and spacing are tolerated")
+        let tilde = Format.parseClockRange("07:40~21:00")
+        expect(tilde != nil && tilde!.end.0 == 21, "a tilde separator is tolerated")
+        expect(Format.parseClockRange("garbage") == nil, "a value with no times is rejected")
+        var badConfig = config
+        badConfig.lunchBreak = "吃完再说"
+        expect(badConfig.schedulingWarnings.contains { $0.contains("休息") },
+               "an unreadable lunch break is reported instead of silently dropped")
+        badConfig.lunchBreak = "12:00-13:00"
+        expect(badConfig.schedulingWarnings.isEmpty,
+               "a readable config produces no warnings (got \(badConfig.schedulingWarnings))")
 
         Console.heading("Free slot calculation")
         let day = try FlexibleDate.parse("2026-09-28 00:00", calendar: calendar, now: anchor)
@@ -76,8 +92,76 @@ struct SelfTestCommand: AsyncParsableCommand {
             rangeEnd: rangeEnd
         )
         expect(conflict?.moved == true, "a conflicting request gets moved")
-        expect(conflict.map { finder.isInsideWorkingWindow(start: $0.start, end: $0.end) } == true,
-               "the moved request stays inside working hours")
+        expect(conflict.map { finder.isInsideAvailableWindow(start: $0.start, end: $0.end) } == true,
+               "the moved request stays inside the available hours")
+
+        Console.heading("Availability rules")
+        expect(Format.describeDays([2, 3, 4, 5, 6]) == "周一–周五",
+               "consecutive weekdays collapse (got \(Format.describeDays([2, 3, 4, 5, 6])))")
+        expect(Format.describeDays([1, 7]) == "周六、周日",
+               "a weekend is listed, not dashed (got \(Format.describeDays([1, 7])))")
+        expect(Format.describeDays([6, 7, 1]) == "周五–周日",
+               "a three-day run across the week boundary collapses (got \(Format.describeDays([6, 7, 1])))")
+        expect(Format.describeDays([2, 4, 6]) == "周一、周三、周五",
+               "scattered days are listed (got \(Format.describeDays([2, 4, 6])))")
+        expect(Format.describeDays([1, 2, 3, 4, 5, 6, 7]) == "每天",
+               "all seven days read as 每天")
+        expect(AppConfig().usesLegacySchedule,
+               "a config with no rules falls back to the legacy single window")
+        expect(AppConfig().effectiveSchedule.count == 1, "the fallback produces exactly one rule")
+
+        var schoolConfig = AppConfig()
+        schoolConfig.timeZone = "Asia/Shanghai"
+        schoolConfig.schedule = [
+            ScheduleRule(days: [2, 3, 4, 5, 6], start: "07:40", end: "21:00",
+                         breaks: ["11:40-12:30（学校）", "17:00-18:00"]),
+            ScheduleRule(days: [1, 7], start: "10:00", end: "18:00"),
+        ]
+        let schoolFinder = SlotFinder(config: schoolConfig)
+        let schoolMonday = try FlexibleDate.parse("2026-09-28 00:00", calendar: calendar, now: anchor)
+        let schoolSaturday = try FlexibleDate.parse("2026-10-03 00:00", calendar: calendar, now: anchor)
+        let mondayWindows = schoolFinder.availableWindows(from: schoolMonday, to: schoolMonday.addingTimeInterval(86_400))
+        let saturdayWindows = schoolFinder.availableWindows(from: schoolSaturday, to: schoolSaturday.addingTimeInterval(86_400))
+        expect(mondayWindows.count == 3,
+               "two breaks split a school day into three windows (got \(mondayWindows.count))")
+        expect(mondayWindows.first.map { Format.clock($0.start, calendar: calendar) } == "07:40"
+                && mondayWindows.last.map { Format.clock($0.end, calendar: calendar) } == "21:00",
+               "the weekday rule runs 07:40–21:00")
+        expect(saturdayWindows.count == 1
+                && Format.clock(saturdayWindows[0].start, calendar: calendar) == "10:00"
+                && Format.clock(saturdayWindows[0].end, calendar: calendar) == "18:00",
+               "the weekend rule takes over on Saturday")
+        expect(schoolFinder.isInsideAvailableWindow(
+            start: try FlexibleDate.parse("2026-09-28 20:00", calendar: calendar, now: anchor),
+            end: try FlexibleDate.parse("2026-09-28 20:30", calendar: calendar, now: anchor)
+        ), "an evening slot on a school day is available")
+        expect(!schoolFinder.isInsideAvailableWindow(
+            start: try FlexibleDate.parse("2026-10-03 09:00", calendar: calendar, now: anchor),
+            end: try FlexibleDate.parse("2026-10-03 09:30", calendar: calendar, now: anchor)
+        ), "Saturday before 10:00 is not available")
+        expect(schoolConfig.availabilitySummary.contains("周一–周五 07:40–21:00"),
+               "the summary describes the rules (got \(schoolConfig.availabilitySummary))")
+        expect(schoolConfig.schedulingWarnings.isEmpty,
+               "a well-formed schedule produces no warnings (got \(schoolConfig.schedulingWarnings))")
+
+        var unionConfig = schoolConfig
+        unionConfig.schedule = [
+            ScheduleRule(days: [2, 3, 4, 5, 6], start: "09:00", end: "12:00"),
+            ScheduleRule(days: [2], start: "18:00", end: "21:00"),
+        ]
+        let unionWindows = SlotFinder(config: unionConfig)
+            .availableWindows(from: schoolMonday, to: schoolMonday.addingTimeInterval(86_400))
+        expect(unionWindows.count == 2,
+               "a Monday-only rule adds a second window instead of replacing the first (got \(unionWindows.count))")
+
+        var brokenRule = AppConfig()
+        brokenRule.schedule = [ScheduleRule(days: [2], start: "21:00", end: "08:00")]
+        expect(brokenRule.schedulingWarnings.contains { $0.contains("结束时间") },
+               "a rule that ends before it starts is reported instead of silently skipped")
+        var legacyBreak = AppConfig()
+        legacyBreak.lunchBreak = "吃完再说"
+        expect(legacyBreak.schedulingWarnings.contains { $0.contains("午休") || $0.contains("休息") },
+               "an unreadable break in the legacy fields is reported too")
 
         Console.heading("Plan validation")
         let context = Planner.Context(
@@ -136,8 +220,8 @@ struct SelfTestCommand: AsyncParsableCommand {
             }
         }, "no proposed event overlaps an existing one")
         expect(plan.unscheduled.isEmpty, "nothing had to be dropped (got \(plan.unscheduled.map { $0.title }))")
-        expect(plan.items.allSatisfy { planner.finder.isInsideWorkingWindow(start: $0.start, end: $0.end) },
-               "every proposed event sits inside working hours")
+        expect(plan.items.allSatisfy { planner.finder.isInsideAvailableWindow(start: $0.start, end: $0.end) },
+               "every proposed event sits inside the available hours")
         expect(plan.items.contains { $0.title == "写周报" && $0.adjustedFrom != nil },
                "the conflicting 写周报 entry was relocated instead of written on top of the standup")
         expect(plan.items.contains { $0.title == "没有时间" && $0.adjustedFrom != nil },
@@ -261,6 +345,117 @@ struct SelfTestCommand: AsyncParsableCommand {
         let firstUser = loopAgent.transcript.first { $0.role == "user" }?.content ?? ""
         expect(firstUser.contains("time: 2026-09-27 10:00:00 +08:00") && firstUser.contains("帮我安排这周"),
                "the model sees the user's timestamp and their text")
+
+        Console.heading("Past-time analysis")
+        func sample(_ title: String, _ from: String, _ to: String, into name: String = "工作") -> EventDTO {
+            EventDTO(
+                id: UUID().uuidString,
+                title: title,
+                start: (try? FlexibleDate.parse(from, calendar: calendar, now: anchor)) ?? anchor,
+                end: (try? FlexibleDate.parse(to, calendar: calendar, now: anchor)) ?? anchor,
+                calendarID: name,
+                calendarName: name
+            )
+        }
+        // Two days of history, plus one event deliberately straddling the window start.
+        let synthetic = [
+            sample("周会", "2026-09-21 09:00", "2026-09-21 11:00"),
+            sample("写论文", "2026-09-21 13:00", "2026-09-21 17:00", into: "个人"),
+            sample("面试", "2026-09-22 10:00", "2026-09-22 11:00"),
+            sample("跨窗口", "2026-09-20 23:00", "2026-09-21 00:30"),
+        ]
+        let analysisRange = try Runtime.resolveRange(
+            from: "2026-09-21 00:00", to: "2026-09-23 00:00", days: 2,
+            defaultStartFromNow: false, config: config
+        )
+        let analysis = CalendarAnalyzer.analyze(
+            events: synthetic,
+            config: config,
+            rangeStart: analysisRange.start,
+            rangeEnd: analysisRange.end
+        )
+        // 2h + 4h + 1h, plus only the 30 in-window minutes of the straddling event.
+        expect(abs(analysis.totalHours - 7.5) < 0.001,
+               "hours are summed and clipped to the window (got \(analysis.totalHours))")
+        // 个人 holds the 4h block; 工作 holds 2h + 1h + the 30 clipped minutes.
+        expect(analysis.byCalendar.first?.calendarName == "个人",
+               "the busiest calendar sorts first (got \(analysis.byCalendar.first?.calendarName ?? "none"))")
+        expect(abs(analysis.byCalendar.map { $0.share }.reduce(0, +) - 1) < 0.001,
+               "calendar shares add up to 100%")
+        expect(analysis.byWeekday.count == 2 && analysis.byWeekday.first?.weekday == "Mon",
+               "weekdays are reported in order (got \(analysis.byWeekday.map { $0.weekday }))")
+        expect(abs((analysis.byWeekday.first?.averageHours ?? 0) - 6.5) < 0.001,
+               "Monday averages 6.5h (got \(analysis.byWeekday.first?.averageHours ?? -1))")
+        expect(analysis.busiestDays.first?.hours == 6.5,
+               "the busiest day is Monday (got \(analysis.busiestDays.first?.hours ?? -1))")
+        // Monday is fully booked either side of lunch; Tuesday afternoon is free.
+        expect(analysis.longestFocusBlockMinutes == 300,
+               "the longest free block is found across the whole window (got \(analysis.longestFocusBlockMinutes))")
+        expect(analysis.utilization > 0 && analysis.utilization < 1,
+               "utilisation lands strictly between 0 and 1 (got \(analysis.utilization))")
+        expect(!analysis.summaryLines.isEmpty, "the analysis renders summary lines")
+
+        Console.heading("Conversation persistence")
+        var stored = ChatSession(title: "写周报", turns: [
+            ChatTurn(kind: .user, text: "帮我安排这周", at: anchor),
+            ChatTurn(kind: .assistant, text: "好的", at: anchor),
+        ])
+        stored.agent.messages = [.system("stable"), .user("hi"), .assistant("hello")]
+        stored.agent.pendingPlan = plan
+        stored.agent.lastUserTurnAt = anchor
+
+        let roundTripped = try CalPilotJSON.decoder().decode(
+            ChatSession.self,
+            from: CalPilotJSON.encoder(pretty: false).encode(stored)
+        )
+        expect(roundTripped.id == stored.id, "a session survives a JSON round trip")
+        expect(roundTripped.turns.count == 2, "the visible turns survive")
+        expect(roundTripped.agent.messages.count == 3, "the model transcript survives")
+        expect(roundTripped.agent.messages.first?.content == "stable", "the system message survives")
+        expect(roundTripped.agent.pendingPlan?.items.count == plan.items.count, "a pending proposal survives")
+        expect(roundTripped.agent.lastUserTurnAt == anchor, "the last turn timestamp survives")
+        expect(ChatSession.suggestedTitle(from: stored.turns) == "帮我安排这周",
+               "the title comes from the first user turn")
+        expect(ChatSession.suggestedTitle(from: [ChatTurn(kind: .user, text: String(repeating: "长", count: 60))], limit: 10)
+                .hasSuffix("…"),
+               "a long title is truncated with an ellipsis")
+
+        // Exercises the real disk path and removes exactly what it wrote.
+        let diskProbe = ChatSession(title: "selftest-probe", turns: [ChatTurn(kind: .notice, text: "probe")])
+        try SessionStore.save(diskProbe)
+        expect(SessionStore.load(id: diskProbe.id)?.title == "selftest-probe",
+               "a session is written to and read back from disk")
+        expect(SessionStore.list().contains { $0.id == diskProbe.id }, "saved sessions appear in the list")
+        try SessionStore.delete(id: diskProbe.id)
+        expect(SessionStore.load(id: diskProbe.id) == nil, "a deleted session is gone")
+
+        Console.heading("Resuming a conversation")
+        let resumeClient = ScriptedClient(script: [])
+        let exported = stored.agent
+        expect(exported.messages.count == 3, "an exported state keeps every message")
+        expect(exported.pendingPlan?.items.count == plan.items.count, "an exported state keeps the proposal")
+
+        // A memory added between sessions must reach the resumed conversation.
+        var grownMemory = MemoryStore()
+        grownMemory.add(text: "新加的偏好", kind: .preference)
+        let resumed = Agent(
+            config: config,
+            service: CalendarService(),
+            client: resumeClient,
+            memory: grownMemory,
+            confirm: { _ in false },
+            now: { anchor },
+            emit: { _ in }
+        )
+        resumed.restore(exported)
+        expect(resumed.systemPrompt().contains("新加的偏好"),
+               "a resumed session picks up memories added since it was saved")
+        expect(exported.messages.first?.content != resumed.systemPrompt(),
+               "the system prompt from disk is not reused verbatim")
+        expect(resumed.transcript.count == 3, "the restored transcript is in place")
+        let resumedTurn = resumed.formattedUserTurn("继续", at: anchor.addingTimeInterval(7_200))
+        expect(resumedTurn.contains("2h since your previous message"),
+               "a resumed session still knows when the last turn was (got \(resumedTurn.split(separator: "\n").first ?? ""))")
 
         Console.heading("Result")
         if failures.isEmpty {
